@@ -1,0 +1,316 @@
+/*
+ * Fused grad_W + AdamW — fully-pipelined WMMA kernel for sm_120.
+ *
+ * Breakthrough: col-major A SMEM layout enables cp.async for BOTH A and B.
+ * Previous versions loaded A synchronously (blocking the pipeline).
+ *
+ * How it works:
+ *   GO is (BT, V) row-major → V is contiguous.
+ *   A in SMEM stored col-major: sa_col[k * BV + m], M contiguous.
+ *   cp.async copies GO[bt, v..v+7] → sa_col[bt*BV + v..v+7]: contiguous on both sides!
+ *   WMMA with col_major A reads directly from this layout.
+ *
+ * Pipeline: 2-stage cp.async for A + B, overlapping loads with WMMA compute.
+ * SMEM: 2 × (A:16KB + B:16KB) = 64 KB < 99 KB.
+ */
+
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <mma.h>
+#include <math.h>
+
+using namespace nvcuda;
+
+constexpr int BV  = 128;
+constexpr int BH  = 128;
+constexpr int BBT = 64;
+constexpr int GSV = 32;
+constexpr int NT  = 256;
+constexpr int NSTAGES = 2;
+
+constexpr int WM = 16, WN = 16, WK = 16;
+constexpr int NV_TILES = BV / WM;
+constexpr int NH_TILES = BH / WN;
+constexpr int NK_TILES = BBT / WK;
+
+// A col-major: sa[k * BV + m] → size = BBT * BV
+// B row-major: sb[k * BH + n] → size = BBT * BH
+constexpr int SA = BBT * BV;
+constexpr int SB = BBT * BH;
+constexpr int SBUF = SA + SB;
+constexpr int SMEM_BYTES = NSTAGES * SBUF * sizeof(__nv_bfloat16);
+
+// ── cp.async ──
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+__device__ __forceinline__ void cp_async_wait_0() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+__device__ __forceinline__ void cp_async_wait_1() {
+    asm volatile("cp.async.wait_group 1;\n" ::);
+}
+
+
+// ── Fully async load stage: cp.async for BOTH A and B ──
+__device__ __forceinline__ void load_stage_full_async(
+    __nv_bfloat16* __restrict__ sa_col,  // col-major: sa_col[k * BV + m]
+    __nv_bfloat16* __restrict__ sb,       // row-major: sb[k * BH + n]
+    const __nv_bfloat16* __restrict__ GO,
+    const __nv_bfloat16* __restrict__ INP,
+    int tv, int th, int bt_start,
+    int BT, int V, int H,
+    int go_stride, int in_stride, int tid
+) {
+    constexpr int VEC = 8;  // 16 bytes / 2 bytes per bf16
+
+    // ── A: cp.async from GO → col-major SMEM ──
+    // GO[bt, v..v+7] → sa_col[bt*BV + v..v+7]: BOTH contiguous → cp.async works!
+    constexpr int A_VEC_PER_ROW = BV / VEC;        // 16
+    constexpr int A_TOTAL_VEC = BBT * A_VEC_PER_ROW; // 1024
+
+    for (int i = tid; i < A_TOTAL_VEC; i += NT) {
+        int btl = i / A_VEC_PER_ROW;
+        int v_chunk = i % A_VEC_PER_ROW;
+        int gbt = bt_start + btl;
+        int gv = tv + v_chunk * VEC;
+
+        __nv_bfloat16* dst = &sa_col[btl * BV + v_chunk * VEC];
+        uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+        if (gbt < BT && gv + VEC <= V) {
+            const void* src = &GO[gbt * go_stride + gv];
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                         :: "r"(smem_addr), "l"(src));
+        } else {
+            // Boundary: element-wise fallback
+            for (int e = 0; e < VEC; e++) {
+                int gve = gv + e;
+                dst[e] = (gbt < BT && gve < V) ? GO[gbt * go_stride + gve]
+                                                 : __float2bfloat16(0.0f);
+            }
+        }
+    }
+
+    // ── B: cp.async from INP → row-major SMEM ──
+    constexpr int B_VEC_PER_ROW = BH / VEC;
+    constexpr int B_TOTAL_VEC = BBT * B_VEC_PER_ROW;
+
+    for (int i = tid; i < B_TOTAL_VEC; i += NT) {
+        int btl = i / B_VEC_PER_ROW;
+        int h_chunk = i % B_VEC_PER_ROW;
+        int gbt = bt_start + btl;
+        int gh = th + h_chunk * VEC;
+
+        __nv_bfloat16* dst = &sb[btl * BH + h_chunk * VEC];
+        uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+        if (gbt < BT && gh + VEC <= H) {
+            const void* src = &INP[gbt * in_stride + gh];
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                         :: "r"(smem_addr), "l"(src));
+        } else {
+            for (int e = 0; e < VEC; e++) {
+                int ghe = gh + e;
+                dst[e] = (gbt < BT && ghe < H) ? INP[gbt * in_stride + ghe]
+                                                 : __float2bfloat16(0.0f);
+            }
+        }
+    }
+}
+
+
+__global__ void __launch_bounds__(NT)
+fused_grad_adamw_v3_kernel(
+    const __nv_bfloat16* __restrict__ GO,
+    const __nv_bfloat16* __restrict__ INP,
+    __nv_bfloat16* __restrict__ W,
+    __nv_bfloat16* __restrict__ MB,
+    __nv_bfloat16* __restrict__ VB,
+    int BT, int V, int H,
+    int go_stride, int in_stride, int w_stride,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2,
+    int num_sms
+) {
+    const int tid = threadIdx.x;
+    const int wid = tid / 32;
+    const int lane = tid % 32;
+    const int ntv = (V + BV - 1) / BV;
+    const int nth = (H + BH - 1) / BH;
+    const int total_tiles = ntv * nth;
+
+    extern __shared__ __nv_bfloat16 smem[];
+    auto sa_col = [&](int stage) -> __nv_bfloat16* { return smem + stage * SBUF; };
+    auto sb     = [&](int stage) -> __nv_bfloat16* { return smem + stage * SBUF + SA; };
+
+    wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc[NV_TILES];
+
+    for (int tile = blockIdx.x; tile < total_tiles; tile += num_sms) {
+        int grp_n = GSV * nth;
+        int gid = tile / grp_n;
+        int fpv = gid * GSV;
+        int gsz = min(ntv - fpv, GSV);
+        int pv = fpv + ((tile % grp_n) % gsz);
+        int ph = (tile % grp_n) / gsz;
+        int tv = pv * BV;
+        int th = ph * BH;
+
+        #pragma unroll
+        for (int i = 0; i < NV_TILES; i++)
+            wmma::fill_fragment(acc[i], 0.0f);
+
+        int num_chunks = (BT + BBT - 1) / BBT;
+
+        // ── Pipeline prologue: fill stages with FULLY ASYNC loads ──
+        load_stage_full_async(sa_col(0), sb(0), GO, INP, tv, th, 0,
+                              BT, V, H, go_stride, in_stride, tid);
+        cp_async_commit();
+
+        if (num_chunks > 1) {
+            load_stage_full_async(sa_col(1), sb(1), GO, INP, tv, th, BBT,
+                                  BT, V, H, go_stride, in_stride, tid);
+            cp_async_commit();
+        }
+
+        // ── Main loop ──
+        for (int chunk = 0; chunk < num_chunks; chunk++) {
+            int stage = chunk % NSTAGES;
+
+            // Wait for this stage's async loads
+            if (chunk == 0) {
+                if (num_chunks > 1) cp_async_wait_1(); else cp_async_wait_0();
+            } else {
+                cp_async_wait_1();
+            }
+            __syncthreads();
+
+            // Launch next stage (fully async)
+            int next = chunk + NSTAGES;
+            if (next < num_chunks) {
+                load_stage_full_async(
+                    sa_col(next % NSTAGES), sb(next % NSTAGES),
+                    GO, INP, tv, th, next * BBT,
+                    BT, V, H, go_stride, in_stride, tid);
+                cp_async_commit();
+            }
+
+            // ── WMMA matmul ──
+            // A in col-major SMEM: sa_col[k * BV + m], leading dim = BV
+            // B in row-major SMEM: sb[k * BH + n], leading dim = BH
+            __nv_bfloat16* sa_cur = sa_col(stage);
+            __nv_bfloat16* sb_cur = sb(stage);
+
+            if (wid < NH_TILES) {
+                #pragma unroll
+                for (int kt = 0; kt < NK_TILES; kt++) {
+                    // B fragment: row-major, ptr = sb[kt*WK row, wid*WN col]
+                    wmma::fragment<wmma::matrix_b, WM, WN, WK,
+                                   __nv_bfloat16, wmma::row_major> bf;
+                    wmma::load_matrix_sync(bf,
+                        sb_cur + kt * WK * BH + wid * WN, BH);
+
+                    #pragma unroll
+                    for (int vt = 0; vt < NV_TILES; vt++) {
+                        // A fragment: COL-MAJOR, ptr = sa_col[kt*WK k-row, vt*WM m-col]
+                        // In col-major: ptr = sa_col + kt*WK*BV + vt*WM
+                        wmma::fragment<wmma::matrix_a, WM, WN, WK,
+                                       __nv_bfloat16, wmma::col_major> af;
+                        wmma::load_matrix_sync(af,
+                            sa_cur + kt * WK * BV + vt * WM, BV);
+
+                        wmma::mma_sync(acc[vt], af, bf, acc[vt]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        cp_async_wait_0();
+        __syncthreads();
+
+        // ── AdamW epilogue ──
+        if (wid < NH_TILES) {
+            float* acc_smem = reinterpret_cast<float*>(smem);
+
+            #pragma unroll
+            for (int vt = 0; vt < NV_TILES; vt++) {
+                wmma::store_matrix_sync(
+                    acc_smem + wid * WM * WN,
+                    acc[vt], WN, wmma::mem_row_major);
+                __syncwarp();
+
+                int base_v = tv + vt * WM;
+                int base_h = th + wid * WN;
+
+                for (int e = lane; e < WM * WN; e += 32) {
+                    int r = e / WN, c = e % WN;
+                    int gv = base_v + r, gh = base_h + c;
+                    if (gv < V && gh < H) {
+                        float g = acc_smem[wid * WM * WN + r * WN + c];
+                        int idx = gv * w_stride + gh;
+
+                        unsigned short wr, mr, vr;
+                        asm volatile("ld.global.cs.u16 %0, [%1];" : "=h"(wr) : "l"(&W[idx]));
+                        asm volatile("ld.global.cs.u16 %0, [%1];" : "=h"(mr) : "l"(&MB[idx]));
+                        asm volatile("ld.global.cs.u16 %0, [%1];" : "=h"(vr) : "l"(&VB[idx]));
+
+                        float wf = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&wr));
+                        float mf = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&mr));
+                        float vf = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&vr));
+
+                        mf = beta1 * mf + (1.0f - beta1) * g;
+                        vf = beta2 * vf + (1.0f - beta2) * g * g;
+                        wf = wf * (1.0f - lr * wd) - lr * (mf / bc1) / (sqrtf(vf / bc2) + eps);
+
+                        __nv_bfloat16 wo = __float2bfloat16(wf);
+                        __nv_bfloat16 mo = __float2bfloat16(mf);
+                        __nv_bfloat16 vo = __float2bfloat16(vf);
+                        asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(&W[idx]),
+                            "h"(*reinterpret_cast<unsigned short*>(&wo)));
+                        asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(&MB[idx]),
+                            "h"(*reinterpret_cast<unsigned short*>(&mo)));
+                        asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(&VB[idx]),
+                            "h"(*reinterpret_cast<unsigned short*>(&vo)));
+                    }
+                }
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+    }
+}
+
+
+void fused_grad_adamw_v3(
+    torch::Tensor grad_output, torch::Tensor input,
+    torch::Tensor weight, torch::Tensor m, torch::Tensor v,
+    float lr, float beta1, float beta2, float eps, float weight_decay,
+    float bias_correction1, float bias_correction2
+) {
+    TORCH_CHECK(grad_output.is_cuda() && grad_output.scalar_type() == torch::kBFloat16);
+    int BT = grad_output.size(0), V = grad_output.size(1), H = input.size(1);
+    int dev; cudaGetDevice(&dev);
+    int nsm; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+
+    cudaFuncSetAttribute(fused_grad_adamw_v3_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+
+    fused_grad_adamw_v3_kernel<<<nsm, NT, SMEM_BYTES>>>(
+        reinterpret_cast<const __nv_bfloat16*>(grad_output.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(m.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
+        BT, V, H,
+        (int)grad_output.stride(0), (int)input.stride(0), (int)weight.stride(0),
+        lr, beta1, beta2, eps, weight_decay,
+        bias_correction1, bias_correction2, nsm);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_grad_adamw_v3", &fused_grad_adamw_v3,
+          "Fused grad_W + AdamW v3 (full cp.async pipeline + col-major A + WMMA)");
+}

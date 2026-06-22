@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use FORGE, please cite the following."
+title: "FORGE: Fused On-Register Gradient Elimination for Memory-Efficient LLM Training"
+authors:
+  - family-names: Kukreja
+    given-names: Dikshant
+  - family-names: Prasad
+    given-names: Kritarth
+  - family-names: Anand
+    given-names: Avinash
+  - family-names: Wang
+    given-names: Zhengkui
+  - family-names: Cambria
+    given-names: Erik
+  - family-names: Liu
+    given-names: Timothy
+  - family-names: Ng
+    given-names: Aik Beng
+  - family-names: See
+    given-names: Simon
+  - family-names: Chatterjee
+    given-names: Bapi
+year: 2026
+license: Apache-2.0
+repository-code: "https://github.com/dk4248/FORGE"

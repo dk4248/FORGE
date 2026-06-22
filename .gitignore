@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.ipynb_checkpoints/
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Triton / Torch caches
+.triton/
+*.cubin
+*.ptx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Large local artifacts (keep curated assets/ only)
+*.ckpt
+*.pt
+*.safetensors
+benchmarks/results/**/*.log

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fused-grad-optimizer"
+version = "1.0.0"
+description = "FORGE: fused on-register gradient elimination — tile-wise weight update without materializing grad_weight"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Dikshant Kukreja", email = "dikshant@puch.ai" },
+    { name = "Kritarth Prasad" },
+    { name = "Avinash Anand" },
+    { name = "Zhengkui Wang" },
+    { name = "Erik Cambria" },
+    { name = "Timothy Liu" },
+    { name = "Aik Beng Ng" },
+    { name = "Simon See" },
+    { name = "Bapi Chatterjee" },
+]
+keywords = ["llm", "training", "optimizer", "triton", "memory-efficient", "adamw", "gpu", "fused-kernel"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    # Triton>=3.4 required for tl.make_tensor_descriptor (Hopper TMA path in
+    # kernel.py). Torch 2.6 pins triton==3.2 — if the resolver tries to
+    # downgrade, install with `pip install --no-deps -e .`.
+    "torch>=2.1.0",
+    "triton>=3.4.0",
+    "ninja",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+bench = ["transformers>=4.40.0", "safetensors", "accelerate"]
+
+[project.urls]
+Homepage = "https://github.com/dk4248/FORGE"
+Repository = "https://github.com/dk4248/FORGE"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
