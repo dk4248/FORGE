@@ -123,6 +123,40 @@ for step, batch in enumerate(dataloader):
 
 See [`examples/quickstart.py`](examples/quickstart.py) for a runnable toy example.
 
+### Architectures with custom CUDA ops (RWKV-7)
+
+For architectures that mix `nn.Linear` projections with custom CUDA kernels, only
+the Linear layers should be wrapped. RWKV-7 ("Goose") is the canonical example:
+its WKV delta-rule kernel is a custom CUDA op and must keep its standard backward.
+
+```python
+from fused_grad_optimizer.model_wrappers import wrap_rwkv7
+
+model, manager = wrap_rwkv7(model, optimizer_type="adamw", state_mode="int8")
+# wrap_rwkv7 replaces every nn.Linear (key/value/receptance/output/gate/FFN/head)
+# and skips the WKV op automatically — it is not nn.Linear.
+
+non_fused_opt = torch.optim.AdamW(manager.get_non_fused_params(), lr=1e-4)
+```
+
+With `state_mode="int8"` (int8 optimizer moments), full fine-tuning of G1i 2.9B
+fits on a 16 GB card (~13 GB peak vs. ~35 GB standard AdamW).
+
+**Estimated peak VRAM — G1i 2.9B, bf16 weights, batch 1, seq 512:**
+
+| Method | Weights | Grad tensor | Moments | Activations | Est. peak |
+|---|:--:|:--:|:--:|:--:|:--:|
+| standard AdamW (fp32 m,v) | 5.8 GB | 5.8 GB | 23.2 GB | ~1 GB | **~36 GB** |
+| bitsandbytes 8-bit Adam | 5.8 GB | 5.8 GB | 5.8 GB | ~1 GB | **~19 GB** |
+| **FORGE (int8 moments)** | 5.8 GB | **0 GB** | 5.8 GB | ~1 GB | **~13 GB** |
+
+Formula: weights = params × 2 B (bf16); grad = weights (bf16, eliminated by FORGE);
+fp32 moments = params × 8 B; int8 moments = params × 2 B.
+
+> These are analytical estimates from the FORGE gradient-pool formula.
+> Measured numbers on RTX 4090 / 5080 will replace this table once a GPU run is available.
+> See [`examples/rwkv7_example.py`](examples/rwkv7_example.py).
+
 ## 🧠 How it works
 
 For each weight tile, FORGE accumulates `grad_output.T @ input` in fp32 registers via a loop over the token dimension, then applies the optimizer immediately — so the full `grad_W` is never written to HBM. A standard bf16 step streams sixteen bytes per parameter through HBM; FORGE moves twelve, and moves them closer to peak bandwidth. The trade-off is **read amplification**: activations are re-read once per weight tile. Autotuned tile sizes, a zero-cost virtual transpose, native bf16 tensor cores, and grouped tile ordering for L2 reuse keep that cost small — and it buys the elimination of the entire optimizer step.
