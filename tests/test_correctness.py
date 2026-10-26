@@ -215,6 +215,52 @@ class TestFusedGradAdamWInt8State:
         # m_q should now have non-zero values
         assert m_q.any(), "m_q should have non-zero values after update"
 
+    @pytest.mark.parametrize("kernel", ["fused", "optimizer_only"])
+    def test_ragged_tile_scale_store(self, kernel):
+        """A tile wider than the last scale group must not write past the scale row.
+
+        H=192 with a 128-wide tile: the second tile holds one real QBLOCK group and
+        one padding group, whose scale used to land in the next row's column 0
+        (and past the end of the tensor for the last row).
+        """
+        from fused_grad_optimizer import kernel as K
+
+        torch.manual_seed(0)
+        device = "cuda"
+        BT, V, H, qblock = 64, 128, 192, 64
+        grad_output = torch.randn(BT, V, device=device)
+        input = torch.randn(BT, H, device=device)
+        grad = grad_output.t() @ input
+        weight = torch.randn(V, H, device=device)
+        m_q = torch.zeros(V, H, dtype=torch.int8, device=device)
+        v_q = torch.zeros_like(m_q)
+        # One sentinel row past the end catches out-of-bounds scale writes.
+        m_buf = torch.full((V + 1, H // qblock), 7.0, device=device)
+        v_buf = torch.full_like(m_buf, 7.0)
+        m_scale, v_scale = m_buf[:V], v_buf[:V]
+        hp = (1e-3, 0.9, 0.999, 1e-8, 0.0, 1.0 - 0.9, 1.0 - 0.999)
+
+        if kernel == "fused":
+            K._fused_grad_adamw_int8state_kernel.fn[(1 * 2,)](
+                grad_output, input, weight, m_q, v_q, m_scale, v_scale, BT, V, H,
+                grad_output.stride(0), grad_output.stride(1), input.stride(0), input.stride(1),
+                weight.stride(0), weight.stride(1), m_q.stride(0), m_q.stride(1),
+                m_scale.stride(0), m_scale.stride(1), *hp,
+                BLOCK_V=128, BLOCK_H=128, BLOCK_BT=32, GROUP_SIZE_V=8, QBLOCK=qblock,
+            )
+        else:
+            K._optimizer_only_adamw_int8state_kernel.fn[(1, 2)](
+                grad, weight, m_q, v_q, m_scale, v_scale, V, H,
+                grad.stride(0), grad.stride(1), weight.stride(0), weight.stride(1),
+                m_q.stride(0), m_q.stride(1), m_scale.stride(0), m_scale.stride(1), *hp,
+                BLOCK_R=128, BLOCK_C=128, QBLOCK=qblock,
+            )
+
+        # Step 1 from zero state: m = (1 - beta1) * grad, scale = group absmax / 127.
+        m_ref = (0.1 * grad).abs().view(V, H // qblock, qblock).amax(-1) / 127.0 + 1e-12
+        torch.testing.assert_close(m_scale, m_ref, rtol=1e-2, atol=0)
+        assert (m_buf[V] == 7.0).all() and (v_buf[V] == 7.0).all(), "scale write past end of tensor"
+
 
 class TestFusedLinearQuantized:
 
