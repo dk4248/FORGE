@@ -451,7 +451,7 @@ def _fused_grad_adamw_int8state_kernel(
 
         sc = pid_h * BPT + qb
         tl.store(m_scale_ptr + v_off * ms_stride_v + sc * ms_stride_h,
-                 qb_scale, mask=v_mask)
+                 qb_scale, mask=v_mask & (sc < H // QBLOCK))
 
         m_div = tl.where(qb_mask[None, :], m / qb_scale[:, None], 0.0)
         m_q_val = tl.extra.cuda.libdevice.rint(m_div).to(tl.int32)
@@ -469,7 +469,7 @@ def _fused_grad_adamw_int8state_kernel(
 
         sc = pid_h * BPT + qb
         tl.store(v_scale_ptr + v_off * ms_stride_v + sc * ms_stride_h,
-                 qb_scale, mask=v_mask)
+                 qb_scale, mask=v_mask & (sc < H // QBLOCK))
 
         v_div = tl.where(qb_mask[None, :], v / qb_scale[:, None], 0.0)
         v_q_val = tl.extra.cuda.libdevice.rint(v_div).to(tl.int32)
@@ -555,7 +555,7 @@ def _optimizer_only_adamw_int8state_kernel(
 
         sc = pid_c * BPC + qb
         tl.store(m_scale_ptr + r_off * ms_stride_r + sc * ms_stride_c,
-                 qb_scale, mask=r_mask)
+                 qb_scale, mask=r_mask & (sc < cols // QBLOCK))
 
         m_div = tl.where(qb_mask[None, :], m / qb_scale[:, None], 0.0)
         m_q_val = tl.extra.cuda.libdevice.rint(m_div).to(tl.int32)
@@ -573,7 +573,7 @@ def _optimizer_only_adamw_int8state_kernel(
 
         sc = pid_c * BPC + qb
         tl.store(v_scale_ptr + r_off * ms_stride_r + sc * ms_stride_c,
-                 qb_scale, mask=r_mask)
+                 qb_scale, mask=r_mask & (sc < cols // QBLOCK))
 
         v_div = tl.where(qb_mask[None, :], v / qb_scale[:, None], 0.0)
         v_q_val = tl.extra.cuda.libdevice.rint(v_div).to(tl.int32)
@@ -1169,9 +1169,9 @@ def _fused_grad_adamw_persistent_tma_ws_int8state(
 
             sc = pid_h * BPT + qb
             tl.store(m_scale_ptr + v_off * ms_stride_v + sc * ms_stride_h,
-                     m_scale_qb, mask=v_mask)
+                     m_scale_qb, mask=v_mask & (sc < H // QBLOCK))
             tl.store(v_scale_ptr + v_off * ms_stride_v + sc * ms_stride_h,
-                     v_scale_qb, mask=v_mask)
+                     v_scale_qb, mask=v_mask & (sc < H // QBLOCK))
 
         m_q_desc.store([off_v, off_h], m_q_out)
         v_q_desc.store([off_v, off_h], v_q_out)
